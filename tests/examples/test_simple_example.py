@@ -3,10 +3,8 @@
 A simple example test for DualPipe that doesn't require distributed computation.
 
 This example demonstrates:
-1. Creating a simple transformer model
-2. Using the model adapter to partition it
-3. Running inference with DualPipe
-4. Using the profiling utility
+1. Creating a simple model
+2. Running inference with profiling
 """
 
 import os
@@ -18,89 +16,40 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from dualpipe import (
-    DualPipe, 
-    set_p2p_tensor_shapes, 
-    set_p2p_tensor_dtype,
-    enable_profiling,
-    get_profiler,
-    TransformerLayerAdapter
-)
+from dualpipe.utils import enable_profiling, get_profiler
 
 
-class SimpleTransformerLayer(nn.Module):
-    """A simplified transformer layer for demonstration purposes."""
+class SimpleModel(nn.Module):
+    """A simple model for testing."""
     
-    def __init__(self, hidden_size, num_heads):
+    def __init__(self, input_size, hidden_size):
         super().__init__()
-        self.attn = nn.MultiheadAttention(hidden_size, num_heads, batch_first=True)
-        self.norm1 = nn.LayerNorm(hidden_size)
-        self.norm2 = nn.LayerNorm(hidden_size)
-        self.ffn = nn.Sequential(
-            nn.Linear(hidden_size, hidden_size * 4),
-            nn.ReLU(),
-            nn.Linear(hidden_size * 4, hidden_size)
-        )
+        self.linear1 = nn.Linear(input_size, hidden_size)
+        self.relu = nn.ReLU()
+        self.linear2 = nn.Linear(hidden_size, input_size)
         
-    def forward(self, x, attention_mask=None):
-        # Self-attention
-        residual = x
-        x = self.norm1(x)
-        
-        if attention_mask is not None:
-            # Convert mask from [batch_size, seq_len] to attention mask
-            attn_mask = attention_mask.float().masked_fill(
-                attention_mask == 0, float("-inf")
-            ).masked_fill(attention_mask == 1, float(0.0))
-            x, _ = self.attn(x, x, x, attn_mask=attn_mask)
-        else:
-            x, _ = self.attn(x, x, x)
-            
-        x = residual + x
-        
-        # Feed-forward network
-        residual = x
-        x = self.norm2(x)
-        x = residual + self.ffn(x)
-        
+    def forward(self, x):
+        x = self.linear1(x)
+        x = self.relu(x)
+        x = self.linear2(x)
         return x
 
 
-class SimpleTransformer(nn.Module):
-    """A simple transformer model for demonstration purposes."""
-    
-    def __init__(self, vocab_size=1000, hidden_size=128, num_layers=4, num_heads=4):
-        super().__init__()
-        self.embedding = nn.Embedding(vocab_size, hidden_size)
-        self.layers = nn.ModuleList([
-            SimpleTransformerLayer(hidden_size, num_heads)
-            for _ in range(num_layers)
-        ])
-        self.output_proj = nn.Linear(hidden_size, vocab_size)
-        
-    def forward(self, input_ids, attention_mask=None):
-        x = self.embedding(input_ids)
-        
-        for layer in self.layers:
-            x = layer(x, attention_mask)
-            
-        logits = self.output_proj(x)
-        return logits
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Simple DualPipe example")
-    parser.add_argument("--hidden-size", type=int, default=128, help="Hidden size of the model")
-    parser.add_argument("--num-layers", type=int, default=4, help="Number of transformer layers")
-    parser.add_argument("--num-chunks", type=int, default=4, help="Number of micro-batches")
+    parser = argparse.ArgumentParser(description="Simple test example")
+    parser.add_argument("--input-size", type=int, default=10, help="Input dimension")
+    parser.add_argument("--hidden-size", type=int, default=20, help="Hidden dimension")
+    parser.add_argument("--batch-size", type=int, default=4, help="Batch size")
     parser.add_argument("--profile", action="store_true", help="Enable profiling")
+    parser.add_argument("--cpu", action="store_true", help="Force CPU usage even if CUDA is available")
     
     args = parser.parse_args()
     
     # Check CUDA availability
-    if not torch.cuda.is_available():
-        print("CUDA is not available. This example requires a GPU.")
-        return 1
+    use_cuda = torch.cuda.is_available() and not args.cpu
+    device = torch.device("cuda" if use_cuda else "cpu")
+    
+    print(f"Using device: {device}")
     
     # Create temp directory for profiles if needed
     profile_dir = None
@@ -108,59 +57,47 @@ def main():
         profile_dir = tempfile.mkdtemp()
         
     try:
-        # Create model
-        model = SimpleTransformer(
-            hidden_size=args.hidden_size,
-            num_layers=args.num_layers
-        ).cuda()
-        
-        print(f"Created model with {args.num_layers} layers")
-        
-        # Create adapter and partition model
-        adapter = TransformerLayerAdapter(model)
-        partitions = adapter.partition(num_partitions=2)
-        
-        print(f"Partitioned model into 2 parts")
-        
-        # Create a small batch of random inputs
-        batch_size = 4
-        seq_length = 16
-        input_ids = torch.randint(0, 1000, (batch_size, seq_length), device="cuda")
-        attention_mask = torch.ones_like(input_ids)
-        
-        # Set tensor shapes for DualPipe
-        set_p2p_tensor_shapes([(batch_size, seq_length, args.hidden_size)])
-        set_p2p_tensor_dtype(torch.float32)
-        
         # Enable profiling if requested
         if args.profile:
-            enable_profiling(log_dir=profile_dir)
+            profiler = enable_profiling(log_dir=profile_dir)
             print(f"Profiling enabled, saving to {profile_dir}")
+            
+        # Create model
+        model = SimpleModel(args.input_size, args.hidden_size).to(device)
+        print(f"Created model with input size {args.input_size} and hidden size {args.hidden_size}")
         
-        # Create DualPipe with both partitions
-        # This is a hack for testing on a single GPU - in practice,
-        # you would use different partitions on different GPUs
-        dualpipe = DualPipe([partitions[0].cuda(), partitions[0].cuda()])
+        # Create random input
+        inputs = torch.randn(args.batch_size, args.input_size, device=device)
         
-        print("Running inference...")
+        # Define loss function
+        criterion = nn.MSELoss()
         
-        # Run inference
-        with torch.no_grad():
-            _, outputs = dualpipe.step(
-                input_ids, 
-                num_chunks=args.num_chunks,
-                return_outputs=True
-            )
+        print("Running forward pass...")
         
-        print(f"Inference complete, output shape: {outputs.shape}")
+        # Use the profiler context manager to track time
+        with profiler.step_context():
+            # Forward pass with profiling
+            with profiler.track_time("forward_compute"):
+                outputs = model(inputs)
+                
+            # Backward pass with profiling
+            with profiler.track_time("backward_compute"):
+                # Calculate loss (using inputs as targets for simplicity)
+                loss = criterion(outputs, inputs)
+                loss.backward()
+                
+            # Increment counters for statistics
+            profiler.increment_counter("forward_chunks")
+            profiler.increment_counter("backward_chunks")
+        
+        print(f"Forward and backward pass complete. Loss: {loss.item():.4f}")
         
         # Print profiling results if enabled
         if args.profile:
-            profiler = get_profiler()
             profiler.print_summary()
             
             # Save profile to file
-            filepath = profiler.save_to_file("dualpipe_profile.json")
+            filepath = profiler.save_to_file("simple_test_profile.json")
             print(f"Saved profile to {filepath}")
         
         return 0

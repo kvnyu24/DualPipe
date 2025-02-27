@@ -18,7 +18,12 @@ class DualPipe(nn.Module):
     ) -> None:
         super().__init__()
 
-        assert next(modules[0].parameters()).device == torch.device(torch.cuda.current_device())
+        # Get device of the module and validate that both modules are on the same device
+        self.device = next(modules[0].parameters()).device
+        module1_device = next(modules[1].parameters()).device
+        if self.device != module1_device:
+            raise ValueError(f"All modules must be on the same device. Found {self.device} and {module1_device}")
+            
         self.module = nn.ModuleList(modules)
         self.overlaped_forward_backward = type(modules[0]) == type(modules[1]) and hasattr(type(modules[0]), "overlaped_forward_backward")
         self.batch_dim = batch_dim
@@ -241,7 +246,7 @@ class DualPipe(nn.Module):
             return
 
         self.current_recv_f_chunk_id[phase] += 1
-        tensors = comm.append_irecv(self.comm_ops, self.prev_rank if phase == 0 else self.next_rank, self.group)
+        tensors = comm.append_irecv(self.comm_ops, self.prev_rank if phase == 0 else self.next_rank, self.group, device=self.device)
         self.input_chunks[phase].append(tensors)
 
     def _send_forward(self, phase: int) -> None:

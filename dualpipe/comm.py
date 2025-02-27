@@ -68,9 +68,12 @@ def get_config() -> DualPipeConfig:
     return _config
 
 
-def build_from_tensor_shapes() -> List[torch.Tensor]:
+def build_from_tensor_shapes(device: Optional[torch.device] = None) -> List[torch.Tensor]:
     """
     Build tensors based on the configured shapes and dtype.
+    
+    Args:
+        device: The device to create tensors on. If None, uses CUDA if available, else CPU.
     
     Returns:
         List of empty tensors with the configured shapes and dtype.
@@ -81,17 +84,21 @@ def build_from_tensor_shapes() -> List[torch.Tensor]:
             "You need to call set_p2p_tensor_shapes and set_p2p_tensor_dtype before building tensors."
         )
     
+    # Use specified device, or default to CUDA if available, otherwise CPU
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
     return [
         torch.empty(
             s, 
             dtype=_config.tensor_dtype, 
-            device="cuda", 
+            device=device, 
             requires_grad=True
         ) for s in _config.tensor_shapes
     ]
 
 
-def append_irecv(ops: List[dist.P2POp], src: int, group: dist.ProcessGroup) -> List[torch.Tensor]:
+def append_irecv(ops: List[dist.P2POp], src: int, group: dist.ProcessGroup, device: Optional[torch.device] = None) -> List[torch.Tensor]:
     """
     Append an irecv operation to the list of communication operations.
     
@@ -99,11 +106,12 @@ def append_irecv(ops: List[dist.P2POp], src: int, group: dist.ProcessGroup) -> L
         ops: List of communication operations to append to.
         src: Source rank to receive from.
         group: Process group for communication.
+        device: The device to create tensors on. If None, uses CUDA if available, else CPU.
         
     Returns:
         List of tensors that will receive the data.
     """
-    tensors = build_from_tensor_shapes()
+    tensors = build_from_tensor_shapes(device)
     src = dist.distributed_c10d.get_global_rank(group, src)
     for tensor in tensors:
         if tensor is not None:
