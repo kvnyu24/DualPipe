@@ -328,8 +328,12 @@ class DualPipe(nn.Module):
                 Otherwise: ``None``.
 
         """
-        assert comm.TENSOR_SHAPES is not None and comm.TENSOR_DTYPE is not None, \
-            "You need to call set_p2p_tensor_shapes and set_p2p_tensor_dtype before doing a step."
+        config = comm.get_config()
+        if not config.validate():
+            raise RuntimeError(
+                "DualPipe configuration is incomplete. "
+                "You need to call set_p2p_tensor_shapes and set_p2p_tensor_dtype before doing a step."
+            )
         
         profiler = get_profiler()
         with profiler.step_context():
