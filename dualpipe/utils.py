@@ -44,7 +44,7 @@ def run_backward(tensors: List[torch.Tensor], grad_tensors: List[torch.Tensor]) 
         allow_unreachable=True,
         accumulate_grad=True,
     )
-    Variable._execution_engine.run_backward(tensors, grad_tensors, **kwargs)
+    Variable._execution_engine.run_backward(tuple(tensors), tuple(grad_tensors), **kwargs)
 
 
 def chunk_tensor(x, chunks, dim):
@@ -198,9 +198,11 @@ class DualPipeProfiler:
         communication_time = sum(self.timings.get("forward_communication", [])) + sum(self.timings.get("backward_communication", []))
         overlapped_time = sum(self.timings.get("overlapped_compute", []))
         
-        if compute_time + communication_time > 0:
-            current_overlap_efficiency = (compute_time + communication_time - total_time) / min(compute_time, communication_time) * 100
-            summary["current_overlap_efficiency_percent"] = current_overlap_efficiency
+        if compute_time > 0 and communication_time > 0:
+            min_time = min(compute_time, communication_time)
+            if min_time > 0:
+                current_overlap_efficiency = (compute_time + communication_time - total_time) / min_time * 100
+                summary["current_overlap_efficiency_percent"] = current_overlap_efficiency
         
         return summary
     
