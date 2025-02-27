@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.distributed as dist
 
 import dualpipe.comm as comm
-from dualpipe.utils import WeightGradStore, run_backward, scatter, gather
+from dualpipe.utils import WeightGradStore, run_backward, scatter, gather, get_profiler
 
 
 class DualPipe(nn.Module):
@@ -74,12 +74,15 @@ class DualPipe(nn.Module):
 
         is_last_stage = (self.is_first_rank and phase == 1) or (self.is_last_rank and phase == 0)
 
-        outputs = self.module[phase](*inputs)
-        outputs = [outputs] if isinstance(outputs, torch.Tensor) else outputs
-        if is_last_stage and self.criterion is not None:
-            labels = self.labels[phase][chunk_id]
-            loss = self.criterion(*outputs, *labels)
-            self.loss_chunks.append(loss)
+        profiler = get_profiler()
+        profiler.increment_counter("forward_chunks")
+        with profiler.track_time("forward_compute"):
+            outputs = self.module[phase](*inputs)
+            outputs = [outputs] if isinstance(outputs, torch.Tensor) else outputs
+            if is_last_stage and self.criterion is not None:
+                labels = self.labels[phase][chunk_id]
+                loss = self.criterion(*outputs, *labels)
+                self.loss_chunks.append(loss)
 
         if (not is_last_stage) or self.return_outputs:
             self.output_chunks[phase].append(outputs)
@@ -94,29 +97,32 @@ class DualPipe(nn.Module):
 
         is_last_stage = (self.is_first_rank and phase == 1) or (self.is_last_rank and phase == 0)
 
-        WeightGradStore.enabled = enable_zb
-        if is_last_stage:
-            loss = self.loss_chunks[chunk_id]
-            loss.backward()
-            loss.detach_()
-        else:
-            outputs = self.output_chunks[phase][chunk_id]
-            if not self.return_outputs:
-                self.output_chunks[phase][chunk_id] = None
-            output_grads = self.output_grad_chunks[phase][chunk_id]
-            self.output_grad_chunks[phase][chunk_id] = None
-            non_empty = [(t, g) for t, g in zip(outputs, output_grads) if g is not None]
-            outputs, output_grads = list(zip(*non_empty))
-            if len(outputs) > 0:
-                run_backward(outputs, output_grads)
-        WeightGradStore.enabled = False
-        if enable_zb:
-            WeightGradStore.flush()
+        profiler = get_profiler()
+        profiler.increment_counter("backward_chunks")
+        with profiler.track_time("backward_compute"):
+            WeightGradStore.enabled = enable_zb
+            if is_last_stage:
+                loss = self.loss_chunks[chunk_id]
+                loss.backward()
+                loss.detach_()
+            else:
+                outputs = self.output_chunks[phase][chunk_id]
+                if not self.return_outputs:
+                    self.output_chunks[phase][chunk_id] = None
+                output_grads = self.output_grad_chunks[phase][chunk_id]
+                self.output_grad_chunks[phase][chunk_id] = None
+                non_empty = [(t, g) for t, g in zip(outputs, output_grads) if g is not None]
+                outputs, output_grads = list(zip(*non_empty))
+                if len(outputs) > 0:
+                    run_backward(outputs, output_grads)
+            WeightGradStore.enabled = False
+            if enable_zb:
+                WeightGradStore.flush()
 
-        inputs = self.input_chunks[phase][chunk_id]
-        self.input_chunks[phase][chunk_id] = None
-        input_grads = [t.grad for t in inputs]
-        self.input_grad_chunks[phase].append(input_grads)
+            inputs = self.input_chunks[phase][chunk_id]
+            self.input_chunks[phase][chunk_id] = None
+            input_grads = [t.grad for t in inputs]
+            self.input_grad_chunks[phase].append(input_grads)
 
     def _forward_backward_compute_chunk(self, phase0: int, phase1: int) -> None:
         if self.forward_only:
@@ -324,117 +330,120 @@ class DualPipe(nn.Module):
         """
         assert comm.TENSOR_SHAPES is not None and comm.TENSOR_DTYPE is not None, \
             "You need to call set_p2p_tensor_shapes and set_p2p_tensor_dtype before doing a step."
-        self.forward_only = not torch.is_grad_enabled()
-        self.return_outputs = return_outputs
+        
+        profiler = get_profiler()
+        with profiler.step_context():
+            self.forward_only = not torch.is_grad_enabled()
+            self.return_outputs = return_outputs
 
-        rank = self.rank
-        num_ranks = self.num_ranks
-        assert num_ranks % 2 == 0
-        assert num_chunks > 0 and num_chunks % 2 == 0 and num_chunks >= num_ranks * 2, f"{num_chunks=}, {num_ranks=}"
-        num_half_ranks = num_ranks // 2
-        half_rank = min(rank, num_ranks - 1 - rank)
-        half_num_chunks = num_chunks // 2
-        self.num_half_ranks = num_half_ranks
-        self.half_rank = half_rank
+            rank = self.rank
+            num_ranks = self.num_ranks
+            assert num_ranks % 2 == 0
+            assert num_chunks > 0 and num_chunks % 2 == 0 and num_chunks >= num_ranks * 2, f"{num_chunks=}, {num_ranks=}"
+            num_half_ranks = num_ranks // 2
+            half_rank = min(rank, num_ranks - 1 - rank)
+            half_num_chunks = num_chunks // 2
+            self.num_half_ranks = num_half_ranks
+            self.half_rank = half_rank
 
-        if not self.forward_only and (self.is_first_rank or self.is_last_rank):
-            assert criterion is not None
+            if not self.forward_only and (self.is_first_rank or self.is_last_rank):
+                assert criterion is not None
 
-        self._reset_states()
+            self._reset_states()
 
-        inputs = scatter(inputs, half_num_chunks, self.batch_dim)
-        labels = scatter(labels, half_num_chunks, self.batch_dim)
-        if self.is_first_rank:
-            self.input_chunks = (inputs, [])
-            self.labels = ([], labels)
-        elif self.is_last_rank:
-            self.input_chunks = ([], inputs)
-            self.labels = (labels, [])
-        self.criterion = criterion
+            inputs = scatter(inputs, half_num_chunks, self.batch_dim)
+            labels = scatter(labels, half_num_chunks, self.batch_dim)
+            if self.is_first_rank:
+                self.input_chunks = (inputs, [])
+                self.labels = ([], labels)
+            elif self.is_last_rank:
+                self.input_chunks = ([], inputs)
+                self.labels = (labels, [])
+            self.criterion = criterion
 
-        # For the fisrt half of the ranks: phase 0 means forward direction, phase 1 means reverse direction.
-        # For the second half of the ranks: phase 0 means reverse direction, phase 1 means forward direction.
+            # For the fisrt half of the ranks: phase 0 means forward direction, phase 1 means reverse direction.
+            # For the second half of the ranks: phase 0 means reverse direction, phase 1 means forward direction.
 
-        # Step 1: nF0
-        step_1 = (num_half_ranks - half_rank - 1) * 2
-        for i in range(step_1):
-            self._forward_chunk(0)
+            # Step 1: nF0
+            step_1 = (num_half_ranks - half_rank - 1) * 2
+            for i in range(step_1):
+                self._forward_chunk(0)
 
-        # Step 2: nF0F1
-        step_2 = half_rank + 1
-        self._recv_forward(0)
-        for i in range(step_2):
-            self._forward_chunk(0, recv=False, send=self.is_middle_rank)
+            # Step 2: nF0F1
+            step_2 = half_rank + 1
             self._recv_forward(0)
-            self._forward_chunk(1, send=(not self.is_middle_rank) or (i < step_2 - 1))
-            if not self.is_middle_rank:
-                self._send_forward(0)
-
-        # Step 3: nB1W1F1 (Use zero bubble)
-        step_3 = num_half_ranks - half_rank - 1
-        for i in range(step_3):
-            self._backward_chunk(1, enable_zb=True)
-            self._recv_forward(1)
-            self._weight_chunk()
-            self._forward_chunk(1, recv=False)
-
-        # Step 4 (Main step): nF0B1F1B0
-        step_4 = half_num_chunks - num_ranks + half_rank + 1
-        for i in range(step_4):
-            if i == 0:
-                if self.is_middle_rank:
-                    # NOTE: We don't overlap these two chunks to further reduce bubble size.
-                    self._forward_chunk(0, recv=False, send=False)
-                    self._send_forward(1)
-                    self._backward_chunk(1, send=False)
+            for i in range(step_2):
+                self._forward_chunk(0, recv=False, send=self.is_middle_rank)
+                self._recv_forward(0)
+                self._forward_chunk(1, send=(not self.is_middle_rank) or (i < step_2 - 1))
+                if not self.is_middle_rank:
                     self._send_forward(0)
-                    self._send_backward(1)
+
+            # Step 3: nB1W1F1 (Use zero bubble)
+            step_3 = num_half_ranks - half_rank - 1
+            for i in range(step_3):
+                self._backward_chunk(1, enable_zb=True)
+                self._recv_forward(1)
+                self._weight_chunk()
+                self._forward_chunk(1, recv=False)
+
+            # Step 4 (Main step): nF0B1F1B0
+            step_4 = half_num_chunks - num_ranks + half_rank + 1
+            for i in range(step_4):
+                if i == 0:
+                    if self.is_middle_rank:
+                        # NOTE: We don't overlap these two chunks to further reduce bubble size.
+                        self._forward_chunk(0, recv=False, send=False)
+                        self._send_forward(1)
+                        self._backward_chunk(1, send=False)
+                        self._send_forward(0)
+                        self._send_backward(1)
+                    else:
+                        self._forward_backward_chunk(0, 1, recv0=False)
                 else:
-                    self._forward_backward_chunk(0, 1, recv0=False)
-            else:
-                self._forward_backward_chunk(0, 1)
-            self._forward_backward_chunk(1, 0)
+                    self._forward_backward_chunk(0, 1)
+                self._forward_backward_chunk(1, 0)
 
-        # Step 5: nB1F1B0
-        step_5 = num_half_ranks - half_rank - 1
-        for i in range(step_5):
-            self._backward_chunk(1)
-            self._forward_backward_chunk(1, 0)
+            # Step 5: nB1F1B0
+            step_5 = num_half_ranks - half_rank - 1
+            for i in range(step_5):
+                self._backward_chunk(1)
+                self._forward_backward_chunk(1, 0)
 
-        # Step 6: nB1B0 (The second half of the chunks use zero bubble)
-        step_6 = half_rank + 1
-        enable_zb = False
-        for i in range(step_6):
-            if i == step_6 // 2 and half_rank % 2 == 1:
-                enable_zb = True
-            self._backward_chunk(1, enable_zb=enable_zb)
-            if i == step_6 // 2 and half_rank % 2 == 0:
-                enable_zb = True
-            self._backward_chunk(0, enable_zb=enable_zb)
+            # Step 6: nB1B0 (The second half of the chunks use zero bubble)
+            step_6 = half_rank + 1
+            enable_zb = False
+            for i in range(step_6):
+                if i == step_6 // 2 and half_rank % 2 == 1:
+                    enable_zb = True
+                self._backward_chunk(1, enable_zb=enable_zb)
+                if i == step_6 // 2 and half_rank % 2 == 0:
+                    enable_zb = True
+                self._backward_chunk(0, enable_zb=enable_zb)
 
-        # Step 7: nWB0 (Use zero bubble)
-        step_7 = num_half_ranks - half_rank - 1
-        for i in range(step_7):
-            self._weight_chunk()
-            self._backward_chunk(0, enable_zb=True)
+            # Step 7: nWB0 (Use zero bubble)
+            step_7 = num_half_ranks - half_rank - 1
+            for i in range(step_7):
+                self._weight_chunk()
+                self._backward_chunk(0, enable_zb=True)
 
-        # Step 8: nW
-        step_8 = half_rank + 1
-        for i in range(step_8):
-            self._weight_chunk()
-        assert WeightGradStore.funcs_queue.empty()
+            # Step 8: nW
+            step_8 = half_rank + 1
+            for i in range(step_8):
+                self._weight_chunk()
+            assert WeightGradStore.funcs_queue.empty()
 
-        self._commit_and_wait_comm()
+            self._commit_and_wait_comm()
 
-        loss, outputs = None, None
-        if self.is_first_rank or self.is_last_rank:
-            if criterion is not None:
-                loss = torch.stack(self.loss_chunks)
-            if return_outputs:
-                outputs = gather(self.output_chunks[self.is_first_rank], self.batch_dim)
-                if len(outputs) == 1:
-                    outputs = outputs[0]
+            loss, outputs = None, None
+            if self.is_first_rank or self.is_last_rank:
+                if criterion is not None:
+                    loss = torch.stack(self.loss_chunks)
+                if return_outputs:
+                    outputs = gather(self.output_chunks[self.is_first_rank], self.batch_dim)
+                    if len(outputs) == 1:
+                        outputs = outputs[0]
 
-        self._reset_states()
+            self._reset_states()
 
-        return loss, outputs
+            return loss, outputs
